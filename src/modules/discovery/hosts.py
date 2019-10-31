@@ -7,14 +7,14 @@ import time
 from enum import Enum
 
 import requests
-from netaddr import IPNetwork
+from netaddr import IPNetwork, IPAddress
 
 from __main__ import config
 from netifaces import AF_INET, ifaddresses, interfaces
 
 from ...core.events import handler
 from ...core.events.types import Event, NewHostEvent, Vulnerability
-from ...core.types import Hunter, InformationDisclosure, Azure
+from ...core.types import Discovery, InformationDisclosure, Azure
 
 class RunningAsPodEvent(Event):
     def __init__(self):
@@ -22,6 +22,7 @@ class RunningAsPodEvent(Event):
         self.auth_token = self.get_service_account_file("token")
         self.client_cert = self.get_service_account_file("ca.crt")
         self.namespace = self.get_service_account_file("namespace")
+        self.kubeservicehost = os.environ.get("KUBERNETES_SERVICE_HOST", None)
 
     # Event's logical location to be used mainly for reports.
     def location(self):
@@ -41,7 +42,7 @@ class RunningAsPodEvent(Event):
 class AzureMetadataApi(Vulnerability, Event):
     """Access to the Azure Metadata API exposes information about the machines associated with the cluster"""
     def __init__(self, cidr):
-        Vulnerability.__init__(self, Azure, "Azure Metadata Exposure", category=InformationDisclosure)
+        Vulnerability.__init__(self, Azure, "Azure Metadata Exposure", category=InformationDisclosure, vid="KHV003")
         self.cidr = cidr
         self.evidence = "cidr: {}".format(cidr)
 
@@ -55,7 +56,12 @@ class HostDiscoveryHelpers:
     def get_cloud(host):
         try:
             logging.debug("Checking whether the cluster is deployed on azure's cloud")
-            metadata = requests.get("http://www.azurespeed.com/api/region?ipOrUrl={ip}".format(ip=host)).text
+            # azurespeed.com provide their API via HTTP only; the service can be queried with 
+            # HTTPS, but doesn't show a proper certificate. Since no encryption is worse then
+            # any encryption, we go with the verify=false option for the time being. At least
+            # this prevents leaking internal IP addresses to passive eavesdropping.
+            # TODO: find a more secure service to detect cloud IPs
+            metadata = requests.get("https://www.azurespeed.com/api/region?ipOrUrl={ip}".format(ip=host), verify=False).text
         except requests.ConnectionError as e:
             logging.info("- unable to check cloud: {0}".format(e))
             return
@@ -73,7 +79,7 @@ class HostDiscoveryHelpers:
 
 
 @handler.subscribe(RunningAsPodEvent)
-class FromPodHostDiscovery(Hunter):
+class FromPodHostDiscovery(Discovery):
     """Host Discovery when running as pod
     Generates ip adresses to scan, based on cluster/scan type
     """
@@ -91,10 +97,17 @@ class FromPodHostDiscovery(Hunter):
             else:
                 subnets, cloud = self.traceroute_discovery()
 
+            should_scan_apiserver = False
+            if self.event.kubeservicehost:
+                should_scan_apiserver = True
             for subnet in subnets:
+                if self.event.kubeservicehost and self.event.kubeservicehost in IPNetwork("{}/{}".format(subnet[0], subnet[1])):
+                    should_scan_apiserver = False
                 logging.debug("From pod scanning subnet {0}/{1}".format(subnet[0], subnet[1]))
                 for ip in HostDiscoveryHelpers.generate_subnet(ip=subnet[0], sn=subnet[1]):
                     self.publish_event(NewHostEvent(host=ip, cloud=cloud))
+            if should_scan_apiserver:
+                self.publish_event(NewHostEvent(host=IPAddress(self.event.kubeservicehost), cloud=cloud))
 
             
     def is_azure_pod(self):
@@ -109,17 +122,16 @@ class FromPodHostDiscovery(Hunter):
     def traceroute_discovery(self):
         external_ip = requests.get("http://canhazip.com").text # getting external ip, to determine if cloud cluster
         cloud = HostDiscoveryHelpers.get_cloud(external_ip)
-        logging.getLogger("scapy.runtime").setLevel(logging.ERROR) # disables scapy's warnings
         from scapy.all import ICMP, IP, Ether, srp1
 
         node_internal_ip = srp1(Ether() / IP(dst="google.com" , ttl=1) / ICMP(), verbose=0)[IP].src
         return [ [node_internal_ip,"24"], ], external_ip
 
-    # quering azure's interface metadata api | works only from a pod
+    # querying azure's interface metadata api | works only from a pod
     def azure_metadata_discovery(self):
         logging.debug("From pod attempting to access azure's metadata")
         machine_metadata = json.loads(requests.get("http://169.254.169.254/metadata/instance?api-version=2017-08-01", headers={"Metadata":"true"}).text)
-        address, subnet= "", ""
+        address, subnet = "", ""
         subnets = list()
         for interface in machine_metadata["network"]["interface"]:
             address, subnet = interface["ipv4"]["subnet"][0]["address"], interface["ipv4"]["subnet"][0]["prefix"]
@@ -131,7 +143,7 @@ class FromPodHostDiscovery(Hunter):
         return subnets, "Azure"
 
 @handler.subscribe(HostScanEvent)
-class HostDiscovery(Hunter):
+class HostDiscovery(Discovery):
     """Host Discovery
     Generates ip adresses to scan, based on cluster/scan type
     """
@@ -148,7 +160,7 @@ class HostDiscovery(Hunter):
             cloud = HostDiscoveryHelpers.get_cloud(ip)
             for ip in HostDiscoveryHelpers.generate_subnet(ip, sn=sn):
                 self.publish_event(NewHostEvent(host=ip, cloud=cloud))                
-        elif config.internal:
+        elif config.interface:
             self.scan_interfaces()
         elif len(config.remote) > 0:
             for host in config.remote:

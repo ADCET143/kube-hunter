@@ -2,11 +2,22 @@ import logging
 import requests
 import json
 import threading
+from src.core.types import InformationDisclosure, DenialOfService, RemoteCodeExec, IdentityTheft, PrivilegeEscalation, AccessRisk, UnauthenticatedAccess, KubernetesCluster
 
+class EventFilterBase(object):
+    def __init__(self, event):
+        self.event = event
+
+    # Returns self.event as default.
+    # If changes has been made, should return the new event that's been altered
+    # Return None to indicate the event should be discarded
+    def execute(self):
+        return self.event
 
 class Event(object):
     def __init__(self):
         self.previous = None
+        self.hunter = None
 
     # newest attribute gets selected first
     def __getattr__(self, name):
@@ -59,12 +70,27 @@ class Service(object):
 
 
 class Vulnerability(object):
-    def __init__(self, component, name, category=None):
+    severity = dict({
+        InformationDisclosure: "medium",
+        DenialOfService: "medium",
+        RemoteCodeExec: "high",
+        IdentityTheft: "high",
+        PrivilegeEscalation: "high",
+        AccessRisk: "low",
+        UnauthenticatedAccess: "low"
+    })
+
+    # TODO: make vid mandatry once migration is done
+    def __init__(self, component, name, category=None, vid=None):
+        self.vid = vid
         self.component = component
         self.category = category
         self.name = name
         self.evidence = ""
         self.role = "Node"
+
+    def get_vid(self):
+        return self.vid
 
     def get_category(self):
         if self.category:
@@ -76,6 +102,8 @@ class Vulnerability(object):
     def explain(self):
         return self.__doc__
 
+    def get_severity(self):
+        return self.severity.get(self.category, "low")
 
 global event_id_count_lock
 event_id_count_lock = threading.Lock()
@@ -116,9 +144,28 @@ class OpenPortEvent(Event):
             location = str(self.port)
         return location
 
+
 class HuntFinished(Event):
     pass
 
 
 class HuntStarted(Event):
     pass
+
+
+class ReportDispatched(Event):
+    pass
+
+
+""" Core Vulnerabilites """
+class K8sVersionDisclosure(Vulnerability, Event):
+    """The kubernetes version could be obtained from the {} endpoint """
+    def __init__(self, version, from_endpoint, extra_info=""):
+        Vulnerability.__init__(self, KubernetesCluster, "K8s Version Disclosure", category=InformationDisclosure, vid="KHV002")
+        self.version = version
+        self.from_endpoint = from_endpoint
+        self.extra_info = extra_info
+        self.evidence = version
+
+    def explain(self):
+        return self.__doc__.format(self.from_endpoint) + self.extra_info

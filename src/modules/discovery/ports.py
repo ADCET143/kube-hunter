@@ -1,16 +1,16 @@
 import logging
 
 from socket import socket
-from ...core.types import Hunter
+from ...core.types import Discovery
 
 from ...core.events import handler
 from ...core.events.types import NewHostEvent, OpenPortEvent
 
 
-default_ports = [8001, 10250, 10255, 30000, 443, 6443, 2379]
+default_ports = [8001, 8080, 10250, 10255, 30000, 443, 6443, 2379]
 
 @handler.subscribe(NewHostEvent)
-class PortDiscovery(Hunter):
+class PortDiscovery(Discovery):
     """Port Scanning
     Scans Kubernetes known ports to determine open endpoints for discovery
     """

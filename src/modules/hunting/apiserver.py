@@ -5,14 +5,13 @@ import uuid
 import copy
 
 from ...core.events import handler
-from ...core.events.types import Vulnerability, Event
+from ...core.events.types import Vulnerability, Event, K8sVersionDisclosure
 from ..discovery.apiserver import ApiServer
 from ...core.types import Hunter, ActiveHunter, KubernetesCluster
 from ...core.types import RemoteCodeExec, AccessRisk, InformationDisclosure, UnauthenticatedAccess
 
 
 """ Vulnerabilities """
-
 
 class ServerApiAccess(Vulnerability, Event):
     """ The API Server port is accessible. Depending on your RBAC settings this could expose access to or control of your cluster. """
@@ -24,7 +23,16 @@ class ServerApiAccess(Vulnerability, Event):
         else:
             name = "Unauthenticated access to API"
             category = UnauthenticatedAccess
-        Vulnerability.__init__(self, KubernetesCluster, name=name, category=category)
+        Vulnerability.__init__(self, KubernetesCluster, name=name, category=category, vid="KHV005")
+        self.evidence = evidence
+
+class ServerApiHTTPAccess(Vulnerability, Event):
+    """ The API Server port is accessible over HTTP, and therefore unencrypted. Depending on your RBAC settings this could expose access to or control of your cluster. """
+ 
+    def __init__(self, evidence):
+        name = "Insecure (HTTP) access to API"
+        category = UnauthenticatedAccess
+        Vulnerability.__init__(self, KubernetesCluster, name=name, category=category, vid="KHV006")
         self.evidence = evidence
 
 class ApiInfoDisclosure(Vulnerability, Event):
@@ -33,7 +41,7 @@ class ApiInfoDisclosure(Vulnerability, Event):
             name +=" using service account token"
         else:
             name +=" as anonymous user"
-        Vulnerability.__init__(self, KubernetesCluster, name=name, category=InformationDisclosure)
+        Vulnerability.__init__(self, KubernetesCluster, name=name, category=InformationDisclosure, vid="KHV007")
         self.evidence = evidence
 
 class ListPodsAndNamespaces(ApiInfoDisclosure):
@@ -191,17 +199,17 @@ class ApiServerPassiveHunterFinished(Event):
 @handler.subscribe(ApiServer)
 class AccessApiServer(Hunter):
     """ API Server Hunter
+    Checks if API server is accessible
     """
 
     def __init__(self, event):
         self.event = event
-        self.path = "https://{}:{}".format(self.event.host, self.event.port)
+        self.path = "{}://{}:{}".format(self.event.protocol, self.event.host, self.event.port)
         self.headers = {}
         self.with_token = False
 
     def access_api_server(self):
-        logging.debug('Passive Hunter is attempting to access the API at {host}:{port}'.format(host=self.event.host, 
-            port=self.event.port))
+        logging.debug('Passive Hunter is attempting to access the API at {}'.format(self.path))
         try:
             r = requests.get("{path}/api".format(path=self.path), headers=self.headers, verify=False)
             if r.status_code == 200 and r.content != '':
@@ -248,7 +256,10 @@ class AccessApiServer(Hunter):
     def execute(self):
         api = self.access_api_server()
         if api:
-            self.publish_event(ServerApiAccess(api, self.with_token))
+            if self.event.protocol == "http":
+                self.publish_event(ServerApiHTTPAccess(api))
+            else:
+                self.publish_event(ServerApiAccess(api, self.with_token))
 
         namespaces = self.get_items("{path}/api/v1/namespaces".format(path=self.path))
         if namespaces:
@@ -293,7 +304,7 @@ class AccessApiServerActive(ActiveHunter):
 
     def __init__(self, event):
         self.event = event
-        self.path = "https://{}:{}".format(self.event.host, self.event.port)
+        self.path = "{}://{}:{}".format(self.event.protocol, self.event.host, self.event.port)
 
     def create_item(self, path, name, data):
         headers = {
@@ -545,3 +556,25 @@ class AccessApiServerActive(ActiveHunter):
 
             #  Note: we are not binding any role or cluster role because
             # -- in certain cases it might effect the running pod within the cluster (and we don't want to do that).
+
+@handler.subscribe(ApiServer)
+class ApiVersionHunter(Hunter):
+    """Api Version Hunter
+    Tries to obtain the Api Server's version directly from /version endpoint
+    """
+    def __init__(self, event):
+        self.event = event
+        self.path = "{}://{}:{}".format(self.event.protocol, self.event.host, self.event.port)
+        self.session = requests.Session()
+        self.session.verify = False
+        if self.event.auth_token:
+            self.session.headers.update({"Authorization": "Bearer {}".format(self.event.auth_token)})
+        
+    def execute(self):
+        if self.event.auth_token:
+            logging.debug('Passive Hunter is attempting to access the API server version end point using the pod\'s service account token on {}:{} \t'.format(self.event.host, self.event.port))
+        else:
+            logging.debug('Passive Hunter is attempting to access the API server version end point anonymously')
+        version = json.loads(self.session.get(self.path + "/version").text)["gitVersion"]
+        logging.debug("Discovered version of api server {}".format(version))
+        self.publish_event(K8sVersionDisclosure(version=version, from_endpoint="/version"))

@@ -6,7 +6,7 @@ from src.modules.hunting.apiserver import ListNamespaces, ListPodsAndNamespaces,
 from src.modules.hunting.apiserver import ApiServerPassiveHunterFinished
 from src.modules.hunting.apiserver import CreateANamespace, DeleteANamespace
 from src.modules.discovery.apiserver import ApiServer
-from src.core.events.types import Event
+from src.core.events.types import Event, K8sVersionDisclosure
 from src.core.types import UnauthenticatedAccess, InformationDisclosure
 from src.core.events import handler
 
@@ -35,6 +35,7 @@ def test_AccessApiServer():
     e = ApiServer()
     e.host = "mockKubernetes"
     e.port = 443
+    e.protocol = "https"
 
     with requests_mock.Mocker() as m:
         m.get('https://mockKubernetes:443/api', text='{}')
@@ -44,6 +45,9 @@ def test_AccessApiServer():
                             {"metadata":{"name":"podB", "namespace":"namespaceB"}}]}')
         m.get('https://mockkubernetes:443/apis/rbac.authorization.k8s.io/v1/roles', status_code=403)
         m.get('https://mockkubernetes:443/apis/rbac.authorization.k8s.io/v1/clusterroles', text='{"items":[]}')
+        m.get('https://mockkubernetes:443/version', text='{"major": "1","minor": "13+", "gitVersion": "v1.13.6-gke.13", \
+                          "gitCommit": "fcbc1d20b6bca1936c0317743055ac75aef608ce", "gitTreeState": "clean", "buildDate": "2019-06-19T20:50:07Z", \
+                          "goVersion": "go1.11.5b4", "compiler": "gc", "platform": "linux/amd64"}')
 
         h = AccessApiServer(e)
         h.execute()
@@ -151,6 +155,7 @@ def test_AccessApiServerActive():
     e = ApiServerPassiveHunterFinished(namespaces=["hello-namespace"])
     e.host = "mockKubernetes"
     e.port = 443
+    e.protocol = "https"
 
     with requests_mock.Mocker() as m:
         # TODO more tests here with real responses
